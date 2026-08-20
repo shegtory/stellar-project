@@ -1,4 +1,4 @@
-import { Address, BASE_FEE, Contract, Horizon, Networks, TransactionBuilder, nativeToScVal, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
+import { Address, Asset, BASE_FEE, Contract, Horizon, Networks, Operation, TransactionBuilder, nativeToScVal, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit/sdk";
 import deployment from "../config/deployment.json";
 
@@ -55,6 +55,41 @@ export async function recordPayment({ sender, destination, amount, memo, onStatu
   const result = await waitForTransaction(submitted.hash, onStatus);
   onStatus?.("success", submitted.hash);
   return { hash: submitted.hash, result };
+}
+
+export async function sendAndRecordPayment({ sender, destination, amount, memo, onStatus }) {
+  const source = await horizon.loadAccount(sender);
+  const paymentTransaction = new TransactionBuilder(source, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(Operation.payment({ destination, asset: Asset.native(), amount: String(amount) }))
+    .setTimeout(60)
+    .build();
+
+  onStatus?.("awaiting-payment-signature", "", "Approve the XLM payment in your wallet.");
+  const { signedTxXdr: signedPaymentXdr } = await StellarWalletsKit.signTransaction(paymentTransaction.toXDR(), {
+    address: sender,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  });
+  const paymentResult = await horizon.submitTransaction(
+    TransactionBuilder.fromXDR(signedPaymentXdr, NETWORK_PASSPHRASE),
+  );
+
+  onStatus?.("payment-success", paymentResult.hash, "XLM transferred. Approve the contract record next.");
+  const contractResult = await recordPayment({
+    sender,
+    destination,
+    amount,
+    memo,
+    onStatus: (state, hash) => onStatus?.(
+      state === "awaiting-signature" ? "awaiting-record-signature" : state,
+      hash || paymentResult.hash,
+      state === "awaiting-signature" ? "Approve the payment record contract call in your wallet." : "",
+    ),
+  });
+
+  return { paymentHash: paymentResult.hash, contractHash: contractResult.hash, result: contractResult.result };
 }
 
 export async function readRecentPayments(limit = 10) {
