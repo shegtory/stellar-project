@@ -48,13 +48,16 @@ export default function App() {
     try {
       const result = await sendAndRecordPayment({ sender: address, destination: form.destination.trim(), amount: form.amount, memo: form.memo.trim(), onStatus: (state, hash = "", message = "") => setStatus({ state, hash, message }) });
       setStatus({ state: "success", hash: result.contractHash, message: "XLM transferred and payment recorded on Testnet." }); setForm(EMPTY_FORM); setBalance(await fetchXlmBalance(address)); await refreshActivity();
-    } catch (error) { setStatus((current) => ({ state: "error", hash: current.hash, message: explainError(error) })); } finally { setBusy(false); }
+    } catch (error) {
+      setStatus((current) => ({ state: "error", hash: current.hash, message: explainError(error) }));
+      fetchXlmBalance(address).then(setBalance).catch(() => {});
+    } finally { setBusy(false); }
   }
 
   return <div className="app-shell">
     <header className="topbar"><div className="brand"><span className="signal-mark">S</span><div><h1>Signal</h1><p>Payment tracker · Yellow Belt</p></div></div><div className="wallet-area"><span className="network-pill">TESTNET</span>{address ? <><button className="wallet-chip" onClick={openWalletProfile}>{shorten(address)}</button><button className="button ghost" onClick={disconnectWallet}>Disconnect</button></> : <button className="button primary" onClick={handleConnect} disabled={busy}>Choose wallet</button>}</div></header>
     <main>
-      <section className="hero-panel"><div><span className="eyebrow">ON-CHAIN PAYMENT LOG</span><h2>Record proof.<br />Watch it land.</h2><p>Connect with Freighter, xBull, Albedo, Rabet and more. Every entry is written to Soroban and synchronized from contract events.</p></div><div className="metric"><span>Balance</span><strong>{address ? (balance === null ? "—" : Number(balance).toLocaleString(undefined, { maximumFractionDigits: 3 })) : "—"}</strong><small>XLM</small></div></section>
+      <section className="hero-panel"><div><span className="eyebrow">ON-CHAIN PAYMENT LOG</span><h2>Record proof.<br />Watch it land.</h2><p>Connect with Freighter, xBull, Albedo, Rabet and more. Every entry is written to Soroban and synchronized from contract events.</p></div><div className="metric"><span>Balance</span><strong>{address ? (balance === null ? "—" : Number(balance).toLocaleString(undefined, { minimumFractionDigits: 5, maximumFractionDigits: 7 })) : "—"}</strong><small>XLM</small></div></section>
       {!isContractConfigured() && <div className="notice"><strong>Deployment pending</strong><span>Set <code>VITE_CONTRACT_ID</code> after deploying the contract to Testnet.</span></div>}
       {status.state !== "idle" && <div className={`tx-status ${status.state}`}><span className="status-dot" /><div><strong>{status.state.replace("-", " ")}</strong><p>{status.message || (status.state === "pending" ? "Waiting for ledger confirmation…" : "Approve the contract call in your wallet.")}</p>{status.hash && <a href={`https://stellar.expert/explorer/testnet/tx/${status.hash}`} target="_blank" rel="noreferrer">{shorten(status.hash, 10, 10)} ↗</a>}</div></div>}
       <div className="workspace-grid">
