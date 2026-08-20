@@ -1,0 +1,107 @@
+name: Yellow Belt contract
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "contracts/**"
+      - ".github/workflows/yellow-belt.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yellow-belt-testnet
+  cancel-in-progress: false
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add wasm32v1-none
+
+      - name: Install verified Stellar CLI
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 \
+            -o stellar-cli.tar.gz \
+            https://github.com/stellar/stellar-cli/releases/download/v27.0.0/stellar-cli-27.0.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "357bf712f6353c28cd33c794402a3c87231757a5b305e6ef1604365af4fdd556  stellar-cli.tar.gz" | sha256sum --check
+          tar -xzf stellar-cli.tar.gz
+          sudo install -m 0755 stellar /usr/local/bin/stellar
+          stellar --version
+
+      - name: Test contract
+        run: cargo test --locked --manifest-path contracts/payment-tracker/Cargo.toml
+
+      - name: Build contract WASM
+        run: stellar contract build --manifest-path contracts/payment-tracker/Cargo.toml
+
+      - name: Upload reproducible WASM
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-payment-tracker-wasm
+          path: contracts/payment-tracker/target/wasm32v1-none/release/signal_payment_tracker.wasm
+          if-no-files-found: error
+
+      - name: Create funded Testnet deployer
+        run: stellar keys generate signal-deployer --network testnet --fund
+
+      - name: Deploy and verify a contract call
+        id: deploy
+        shell: bash
+        run: |
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm contracts/payment-tracker/target/wasm32v1-none/release/signal_payment_tracker.wasm \
+            --source-account signal-deployer \
+            --network testnet \
+            --alias signal-payment-tracker \
+            --optimize=false \
+            --quiet)
+          DEPLOYER=$(stellar keys address signal-deployer)
+          CALL_OUTPUT=$(stellar contract invoke \
+            --id "$CONTRACT_ID" \
+            --source-account signal-deployer \
+            --network testnet \
+            --send=yes \
+            -- record \
+            --sender "$DEPLOYER" \
+            --destination "$DEPLOYER" \
+            --amount 10000000 \
+            --memo "GitHub Actions deployment" 2>&1)
+          echo "$CALL_OUTPUT"
+          TX_HASH=$(echo "$CALL_OUTPUT" | grep -Eo '[0-9a-f]{64}' | tail -1 || true)
+          echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+          echo "tx_hash=$TX_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Record public deployment evidence
+        shell: bash
+        env:
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          TX_HASH: ${{ steps.deploy.outputs.tx_hash }}
+        run: |
+          cat > src/config/deployment.json <<EOF
+          {
+            "network": "testnet",
+            "contractId": "$CONTRACT_ID",
+            "transactionHash": "$TX_HASH"
+          }
+          EOF
+          cat > DEPLOYMENT.md <<EOF
+          # Testnet deployment
+
+          - Network: Stellar Testnet
+          - Contract ID: [$CONTRACT_ID](https://stellar.expert/explorer/testnet/contract/$CONTRACT_ID)
+          - Verification transaction: ${TX_HASH:-See the successful workflow log}
+          - Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/config/deployment.json DEPLOYMENT.md
+          git commit -m "chore: record Yellow Belt Testnet deployment [skip ci]"
+          git push
