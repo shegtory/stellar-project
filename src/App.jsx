@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CONTRACT_ID, fetchPaymentEvents, fetchXlmBalance, isContractConfigured, readRecentPayments, sendAndRecordPayment, shorten } from "./lib/stellar";
 import { connectWallet, disconnectWallet, initWalletKit, openWalletProfile } from "./lib/wallet";
 import "./App.css";
@@ -18,12 +18,23 @@ export default function App() {
   const [records, setRecords] = useState([]);
   const [eventCount, setEventCount] = useState(0);
   const [busy, setBusy] = useState(false);
+  const sessionBaselineId = useRef(null);
+  const sessionBaselineEvents = useRef(null);
 
   const refreshActivity = useCallback(async () => {
     if (!isContractConfigured()) return;
     try {
       const [nextRecords, nextEvents] = await Promise.all([readRecentPayments(10), fetchPaymentEvents()]);
-      setRecords(nextRecords); setEventCount(nextEvents.length);
+      if (sessionBaselineId.current === null) {
+        sessionBaselineId.current = nextRecords.reduce((latest, record) => Math.max(latest, record.id), 0);
+        sessionBaselineEvents.current = new Set(nextEvents.map((event) => event.id));
+        setRecords([]);
+        setEventCount(0);
+        return;
+      }
+      const sessionRecords = nextRecords.filter((record) => record.id > sessionBaselineId.current);
+      setRecords(sessionRecords);
+      setEventCount(nextEvents.filter((event) => !sessionBaselineEvents.current.has(event.id)).length);
     } catch (error) {
       setStatus((current) => current.state === "idle" ? { state: "error", hash: "", message: explainError(error) } : current);
     }
