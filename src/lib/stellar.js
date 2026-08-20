@@ -1,120 +1,79 @@
-import {
-  Horizon,
-  TransactionBuilder,
-  Networks,
-  Operation,
-  Asset,
-  BASE_FEE,
-} from "@stellar/stellar-sdk";
-import {
-  isConnected,
-  requestAccess,
-  getAddress,
-  getNetwork,
-  signTransaction,
-} from "@stellar/freighter-api";
+import { Address, BASE_FEE, Contract, Horizon, Networks, TransactionBuilder, nativeToScVal, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
+import { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit/sdk";
+import deployment from "../config/deployment.json";
 
-// --- Network config (Testnet only, per Level 1 requirements) ---
 export const HORIZON_URL = "https://horizon-testnet.stellar.org";
+export const RPC_URL = "https://soroban-testnet.stellar.org";
 export const NETWORK_PASSPHRASE = Networks.TESTNET;
+export const CONTRACT_ID = import.meta.env.VITE_CONTRACT_ID || deployment.contractId || "";
+const horizon = new Horizon.Server(HORIZON_URL);
+const rpcServer = new rpc.Server(RPC_URL);
 
-const server = new Horizon.Server(HORIZON_URL);
+export const isContractConfigured = () => /^C[A-Z2-7]{55}$/.test(CONTRACT_ID);
 
-/**
- * Checks whether the Freighter browser extension is installed & unlocked.
- */
-export async function checkFreighterInstalled() {
-  const result = await isConnected();
-  if (result.error) throw new Error(result.error);
-  return result.isConnected;
-}
-
-/**
- * Requests the user to connect their Freighter wallet and returns the
- * public address. Also verifies the wallet is set to Testnet.
- */
-export async function connectWallet() {
-  const access = await requestAccess();
-  if (access.error) throw new Error(access.error);
-
-  const network = await getNetwork();
-  if (network.error) throw new Error(network.error);
-
-  if (network.network !== "TESTNET") {
-    throw new Error(
-      `Freighter is set to ${network.network}. Please switch it to Testnet and try again.`
-    );
-  }
-
-  return access.address;
-}
-
-/**
- * Re-reads the currently authorized address (used on page reload if the
- * app previously connected and the user hasn't revoked access).
- */
-export async function getConnectedAddress() {
-  const result = await getAddress();
-  if (result.error) throw new Error(result.error);
-  return result.address || null;
-}
-
-/**
- * Fetches the native XLM balance for a public key from Horizon testnet.
- * Returns null if the account doesn't exist yet (unfunded).
- */
 export async function fetchXlmBalance(publicKey) {
   try {
-    const account = await server.loadAccount(publicKey);
-    const native = account.balances.find((b) => b.asset_type === "native");
-    return native ? native.balance : "0";
-  } catch (err) {
-    if (err?.response?.status === 404) {
-      return null; // account not funded on testnet yet
-    }
-    throw err;
+    const account = await horizon.loadAccount(publicKey);
+    return account.balances.find((item) => item.asset_type === "native")?.balance || "0";
+  } catch (error) {
+    if (error?.response?.status === 404) return null;
+    throw error;
   }
 }
 
-/**
- * Builds, signs (via Freighter), and submits a native XLM payment.
- * Returns the Horizon submission result (includes the tx hash).
- */
-export async function sendPayment({ sourceAddress, destination, amount }) {
-  const sourceAccount = await server.loadAccount(sourceAddress);
-
-  const transaction = new TransactionBuilder(sourceAccount, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(
-      Operation.payment({
-        destination,
-        asset: Asset.native(),
-        amount: String(amount),
-      })
-    )
-    .setTimeout(60)
-    .build();
-
-  const signed = await signTransaction(transaction.toXDR(), {
-    networkPassphrase: NETWORK_PASSPHRASE,
-    address: sourceAddress,
-  });
-  if (signed.error) throw new Error(signed.error);
-
-  const signedTx = TransactionBuilder.fromXDR(
-    signed.signedTxXdr,
-    NETWORK_PASSPHRASE
-  );
-
-  const result = await server.submitTransaction(signedTx);
-  return result;
+function contractClient() {
+  if (!isContractConfigured()) throw new Error("Contract is not configured. Add VITE_CONTRACT_ID to .env.local.");
+  return new Contract(CONTRACT_ID);
 }
 
-/** Shortens a public key / hash for compact display: GABC...WXYZ */
+async function buildContractTransaction(sourceAddress, operation) {
+  const source = await rpcServer.getAccount(sourceAddress);
+  const transaction = new TransactionBuilder(source, { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASE })
+    .addOperation(operation).setTimeout(60).build();
+  return rpcServer.prepareTransaction(transaction);
+}
+
+async function waitForTransaction(hash, onStatus) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const result = await rpcServer.getTransaction(hash);
+    if (result.status === "SUCCESS") return result;
+    if (result.status === "FAILED") throw new Error("Contract transaction failed on-chain.");
+    onStatus?.("pending", hash);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  throw new Error("Confirmation timed out. Check the hash on Stellar Expert.");
+}
+
+export async function recordPayment({ sender, destination, amount, memo, onStatus }) {
+  const operation = contractClient().call("record", new Address(sender).toScVal(), new Address(destination).toScVal(), nativeToScVal(BigInt(Math.round(Number(amount) * 10_000_000)), { type: "i128" }), nativeToScVal(memo || "Signal payment", { type: "string" }));
+  const prepared = await buildContractTransaction(sender, operation);
+  onStatus?.("awaiting-signature");
+  const { signedTxXdr } = await StellarWalletsKit.signTransaction(prepared.toXDR(), { address: sender, networkPassphrase: NETWORK_PASSPHRASE });
+  const submitted = await rpcServer.sendTransaction(TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE));
+  if (submitted.status === "ERROR") throw new Error("RPC rejected the contract transaction.");
+  onStatus?.("pending", submitted.hash);
+  const result = await waitForTransaction(submitted.hash, onStatus);
+  onStatus?.("success", submitted.hash);
+  return { hash: submitted.hash, result };
+}
+
+export async function readRecentPayments(limit = 10) {
+  const source = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+  const transaction = await buildContractTransaction(source, contractClient().call("recent", nativeToScVal(limit, { type: "u32" })));
+  const simulation = await rpcServer.simulateTransaction(transaction);
+  if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result?.retval) return [];
+  return scValToNative(simulation.result.retval).map((record) => ({ ...record, id: Number(record.id), amount: Number(record.amount) / 10_000_000, ledger: Number(record.ledger), sender: String(record.sender), destination: String(record.destination), memo: String(record.memo) })).reverse();
+}
+
+export async function fetchPaymentEvents() {
+  if (!isContractConfigured()) return [];
+  const latest = await rpcServer.getLatestLedger();
+  const paymentTopic = xdr.ScVal.scvSymbol("payment").toXDR("base64");
+  const result = await rpcServer.getEvents({ startLedger: Math.max(1, latest.sequence - 2000), filters: [{ type: "contract", contractIds: [CONTRACT_ID], topics: [[paymentTopic, "*"]] }], limit: 20 });
+  return result.events.map((event) => ({ id: event.id, ledger: event.ledger, txHash: event.txHash, value: scValToNative(event.value) })).reverse();
+}
+
 export function shorten(value, front = 6, back = 6) {
   if (!value) return "";
-  if (value.length <= front + back) return value;
-  return `${value.slice(0, front)}…${value.slice(-back)}`;
+  return value.length <= front + back ? value : `${value.slice(0, front)}…${value.slice(-back)}`;
 }
